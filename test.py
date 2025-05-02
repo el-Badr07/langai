@@ -13321,11 +13321,538 @@ class LLMHandler:
         )
 
 
+from typing import List, Dict, Any, Optional, Union, Callable
+import re
+import json
+import time
+from enum import Enum
+
+class PromptStyle(str, Enum):
+    """Enum for different prompt styles"""
+    SIMPLE = "simple"           # Basic query with context
+    QA = "qa"                   # Question-answering focused
+    ELABORATE = "elaborate"     # More detailed with instructions
+    CONCISE = "concise"         # Focused on brevity
+    CUSTOM = "custom"           # Custom prompt template
 
 
+class ResponseGenerator:
+    """
+    Generates final responses based on queries and retrieved contexts.
+    
+    Handles:
+    - Prompt construction using different templates
+    - LLM interaction and response generation
+    - Citation and reference tracking
+    - Response formatting and enhancement
+    - Response validation and fallback strategies
+    
+    Attributes:
+        llm: LLM handler for generating responses
+        prompt_style: Style of prompts to use
+        max_context_tokens: Maximum tokens allowed for context
+        custom_prompt_template: Optional custom prompt template
+        include_citations: Whether to include citations in responses
+        verbose: Whether to print detailed logs
+        response_validators: Optional validators for response quality
+    """
+    
+    def __init__(
+        self,
+        llm_handler,
+        prompt_style: Union[str, PromptStyle] = PromptStyle.ELABORATE,
+        max_context_tokens: int = 3000,
+        custom_prompt_template: Optional[str] = None,
+        include_citations: bool = True,
+        verbose: bool = False,
+        response_validators: Optional[List[Callable]] = None,
+        post_processors: Optional[List[Callable]] = None
+    ):
+        """
+        Initialize the response generator.
+        
+        Args:
+            llm_handler: LLM handler for generating responses
+            prompt_style: Style of prompts to use
+            max_context_tokens: Maximum tokens allowed for context
+            custom_prompt_template: Optional custom prompt template
+            include_citations: Whether to include citations in responses
+            verbose: Whether to print detailed logs
+            response_validators: Optional validators for response quality
+            post_processors: Optional post-processors for enhancing responses
+        """
+        self.llm = llm_handler
+        self.prompt_style = prompt_style if isinstance(prompt_style, PromptStyle) else PromptStyle(prompt_style)
+        self.max_context_tokens = max_context_tokens
+        self.custom_prompt_template = custom_prompt_template
+        self.include_citations = include_citations
+        self.verbose = verbose
+        self.response_validators = response_validators or []
+        self.post_processors = post_processors or []
+        
+        # Performance tracking
+        self.total_generation_time = 0
+        self.request_count = 0
+        self.successful_requests = 0
+        self.failed_requests = 0
+        self.average_tokens_used = 0
+        
+        # Initialize prompt templates
+        self._initialize_prompt_templates()
+    
+    def _initialize_prompt_templates(self):
+        """Initialize the prompt templates for different styles"""
+        self.prompt_templates = {
+            PromptStyle.SIMPLE: """Context:
+{context}
 
+Question:
+{query}
 
+Answer:""",
+            
+            PromptStyle.QA: """Using the provided context, answer the question accurately and concisely.
+If the information isn't available in the context, respond with "I don't have enough information to answer that question."
 
+Context:
+{context}
+
+Question:
+{query}
+
+Answer:""",
+            
+            PromptStyle.ELABORATE: """You are a helpful AI assistant. Use the following context to provide a comprehensive, accurate, and detailed answer to the question.
+Base your response ONLY on the information provided in the context. If the context doesn't contain relevant information, 
+say "I don't have enough information to answer that question." Do not make up or assume information that is not supported by the context.
+
+Context:
+{context}
+
+Question:
+{query}
+
+Provide a detailed and helpful answer. If appropriate, include relevant citations from the context in your response.
+
+Answer:""",
+            
+            PromptStyle.CONCISE: """Answer the question concisely based on the provided context.
+Be direct and brief, focusing only on the most important information.
+If the context doesn't provide enough information, simply state that.
+
+Context:
+{context}
+
+Question:
+{query}
+
+Concise answer:"""
+        }
+        
+        # If custom template provided, add it to prompt templates
+        if self.custom_prompt_template:
+            self.prompt_templates[PromptStyle.CUSTOM] = self.custom_prompt_template
+    
+    def _select_prompt_template(self) -> str:
+        """Select the appropriate prompt template based on style"""
+        return self.prompt_templates.get(
+            self.prompt_style, 
+            self.prompt_templates[PromptStyle.ELABORATE]
+        )
+    
+    def _format_context(self, context: Union[str, List[Dict[str, Any]]]) -> str:
+        """
+        Format the context for insertion into the prompt.
+        
+        Args:
+            context: Either a string or list of document dictionaries
+            
+        Returns:
+            Formatted context string
+        """
+        # If context is already a string, use it directly
+        if isinstance(context, str):
+            return context
+            
+        # If context is a list of documents, format them
+        formatted_chunks = []
+        for i, doc in enumerate(context):
+            # Extract content and metadata
+            content = doc.get("content", doc.get("page_content", ""))
+            source = doc.get("source", "")
+            title = doc.get("title", "")
+            
+            # Format the chunk with source information
+            if self.include_citations and (source or title):
+                source_info = f" [{title or source}]"
+            else:
+                source_info = ""
+                
+            formatted_chunks.append(f"Document {i+1}{source_info}:\n{content}")
+            
+        return "\n\n".join(formatted_chunks)
+    
+    def _track_performance(self, generation_time: float, tokens_used: int, success: bool):
+        """
+        Track performance metrics for the response generator.
+        
+        Args:
+            generation_time: Time taken to generate response
+            tokens_used: Number of tokens used
+            success: Whether generation was successful
+        """
+        self.request_count += 1
+        self.total_generation_time += generation_time
+        
+        if success:
+            self.successful_requests += 1
+            # Update average tokens used
+            self.average_tokens_used = ((self.average_tokens_used * (self.successful_requests - 1)) + 
+                                        tokens_used) / self.successful_requests
+        else:
+            self.failed_requests += 1
+    
+    def _validate_response(self, response: str, query: str, context: str) -> Dict[str, Any]:
+        """
+        Validate the generated response using validators.
+        
+        Args:
+            response: Generated response
+            query: Original query
+            context: Context used for generation
+            
+        Returns:
+            Dictionary with validation results
+        """
+        validation_results = {
+            "valid": True,
+            "issues": []
+        }
+        
+        # Skip validation if no validators
+        if not self.response_validators:
+            return validation_results
+            
+        # Apply each validator
+        for validator in self.response_validators:
+            try:
+                result = validator(response, query, context)
+                if not result.get("valid", True):
+                    validation_results["valid"] = False
+                    validation_results["issues"].append(result.get("issue", "Unknown validation issue"))
+            except Exception as e:
+                if self.verbose:
+                    print(f"Validator error: {str(e)}")
+                    
+        return validation_results
+    
+    def _apply_post_processors(self, response: str, query: str, context: str) -> str:
+        """
+        Apply post-processing to enhance the response.
+        
+        Args:
+            response: Generated response
+            query: Original query
+            context: Context used for generation
+            
+        Returns:
+            Enhanced response
+        """
+        enhanced_response = response
+        
+        # Apply each post-processor in sequence
+        for processor in self.post_processors:
+            try:
+                result = processor(enhanced_response, query, context)
+                if result:  # Only update if processor returns a result
+                    enhanced_response = result
+            except Exception as e:
+                if self.verbose:
+                    print(f"Post-processor error: {str(e)}")
+                    
+        return enhanced_response
+    
+    def _estimate_tokens(self, text: str) -> int:
+        """
+        Estimate the number of tokens in text.
+        
+        Args:
+            text: Text to estimate tokens for
+            
+        Returns:
+            Estimated token count
+        """
+        # Simple approximation: words / 0.75 (since tokens are typically smaller than words)
+        return int(len(text.split()) / 0.75)
+    
+    def _extract_citations(self, response: str, context_docs: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Extract citations from response and link to source documents.
+        
+        Args:
+            response: Generated response
+            context_docs: Original context documents
+            
+        Returns:
+            Dictionary with citation information
+        """
+        citations = {}
+        
+        # Look for citation patterns [1], [2], etc.
+        citation_refs = re.findall(r'\[(\d+)\]', response)
+        
+        # Map citation numbers to documents if possible
+        for ref in citation_refs:
+            ref_num = int(ref)
+            if 1 <= ref_num <= len(context_docs):
+                doc = context_docs[ref_num - 1]
+                source = doc.get("source", "")
+                title = doc.get("title", "")
+                
+                citations[ref] = {
+                    "source": source,
+                    "title": title,
+                    "document_index": ref_num - 1
+                }
+                
+        return citations
+    
+    def generate_response(
+        self, 
+        query: str, 
+        context: Union[str, List[Dict[str, Any]]],
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None
+    ) -> Dict[str, Any]:
+        """
+        Generate a response based on the query and context.
+        
+        Args:
+            query: User query
+            context: Context information (string or list of documents)
+            max_tokens: Maximum tokens for response
+            temperature: Temperature for generation
+            
+        Returns:
+            Dictionary with response and metadata
+        """
+        start_time = time.time()
+        formatted_context = self._format_context(context)
+        
+        # Check context length and truncate if needed
+        estimated_context_tokens = self._estimate_tokens(formatted_context)
+        if estimated_context_tokens > self.max_context_tokens:
+            if self.verbose:
+                print(f"Context too long ({estimated_context_tokens} tokens), truncating...")
+            
+            # Simple truncation strategy - could be improved
+            context_words = formatted_context.split()
+            formatted_context = " ".join(context_words[:int(self.max_context_tokens * 0.75)])
+            formatted_context += "... [Context truncated due to length]"
+        
+        # Select and format prompt template
+        template = self._select_prompt_template()
+        prompt = template.format(context=formatted_context, query=query)
+        
+        if self.verbose:
+            print(f"Generating response for query: {query}")
+            print(f"Context length (estimated tokens): {estimated_context_tokens}")
+        
+        # Generate response
+        try:
+            response = self.llm.generate_text(
+                prompt=prompt,
+                max_tokens=max_tokens,
+                temperature=temperature
+            )
+            
+            # Calculate tokens used (estimate)
+            prompt_tokens = self._estimate_tokens(prompt)
+            response_tokens = self._estimate_tokens(response)
+            total_tokens = prompt_tokens + response_tokens
+            
+            # Validate response
+            validation_results = self._validate_response(response, query, formatted_context)
+            
+            # Apply post-processing if valid
+            if validation_results["valid"]:
+                enhanced_response = self._apply_post_processors(response, query, formatted_context)
+            else:
+                enhanced_response = response  # Use original if invalid
+            
+            # Extract citations if applicable
+            citations = {}
+            if self.include_citations and isinstance(context, list):
+                citations = self._extract_citations(enhanced_response, context)
+            
+            # Track performance
+            generation_time = time.time() - start_time
+            self._track_performance(generation_time, total_tokens, True)
+            
+            return {
+                "query": query,
+                "response": enhanced_response,
+                "raw_response": response,
+                "generation_time": generation_time,
+                "estimated_tokens": {
+                    "prompt": prompt_tokens,
+                    "response": response_tokens,
+                    "total": total_tokens
+                },
+                "validation": validation_results,
+                "citations": citations
+            }
+            
+        except Exception as e:
+            generation_time = time.time() - start_time
+            self._track_performance(generation_time, 0, False)
+            
+            if self.verbose:
+                print(f"Error generating response: {str(e)}")
+                
+            return {
+                "query": query,
+                "response": f"Error generating response: {str(e)}",
+                "raw_response": None,
+                "generation_time": generation_time,
+                "error": str(e)
+            }
+    
+    def generate_chat_response(
+        self,
+        messages: List[Dict[str, str]],
+        context: Union[str, List[Dict[str, Any]]],
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None
+    ) -> Dict[str, Any]:
+        """
+        Generate a response based on chat history and context.
+        
+        Args:
+            messages: List of chat messages with role and content
+            context: Context information (string or list of documents)
+            max_tokens: Maximum tokens for response
+            temperature: Temperature for generation
+            
+        Returns:
+            Dictionary with response and metadata
+        """
+        start_time = time.time()
+        
+        # Extract the last user message as the query
+        query = ""
+        for message in reversed(messages):
+            if message.get("role") == "user":
+                query = message.get("content", "")
+                break
+                
+        formatted_context = self._format_context(context)
+        
+        # Create a system message with context
+        system_message = f"""You are a helpful AI assistant. Use the following context to provide accurate answers.
+Base your response ONLY on the information provided in the context. If the context doesn't contain relevant information, 
+say "I don't have enough information to answer that question."
+
+Context:
+{formatted_context}"""
+        
+        # Add system message at the beginning
+        chat_messages = [{"role": "system", "content": system_message}] + messages
+        
+        if self.verbose:
+            print(f"Generating chat response for query: {query}")
+        
+        # Generate response
+        try:
+            response = self.llm.generate_chat(
+                messages=chat_messages,
+                max_tokens=max_tokens,
+                temperature=temperature
+            )
+            
+            # Calculate tokens used (estimate)
+            system_tokens = self._estimate_tokens(system_message)
+            messages_tokens = sum(self._estimate_tokens(msg["content"]) for msg in messages)
+            response_tokens = self._estimate_tokens(response)
+            total_tokens = system_tokens + messages_tokens + response_tokens
+            
+            # Track performance
+            generation_time = time.time() - start_time
+            self._track_performance(generation_time, total_tokens, True)
+            
+            return {
+                "query": query,
+                "response": response,
+                "generation_time": generation_time,
+                "estimated_tokens": {
+                    "system": system_tokens,
+                    "messages": messages_tokens,
+                    "response": response_tokens,
+                    "total": total_tokens
+                }
+            }
+            
+        except Exception as e:
+            generation_time = time.time() - start_time
+            self._track_performance(generation_time, 0, False)
+            
+            if self.verbose:
+                print(f"Error generating chat response: {str(e)}")
+                
+            return {
+                "query": query,
+                "response": f"Error generating response: {str(e)}",
+                "generation_time": generation_time,
+                "error": str(e)
+            }
+    
+    def get_performance_metrics(self) -> Dict[str, Any]:
+        """
+        Get performance metrics for the response generator.
+        
+        Returns:
+            Dictionary with performance metrics
+        """
+        avg_generation_time = 0
+        if self.request_count > 0:
+            avg_generation_time = self.total_generation_time / self.request_count
+            
+        success_rate = 0
+        if self.request_count > 0:
+            success_rate = self.successful_requests / self.request_count
+            
+        return {
+            "request_count": self.request_count,
+            "successful_requests": self.successful_requests,
+            "failed_requests": self.failed_requests,
+            "success_rate": success_rate,
+            "total_generation_time": self.total_generation_time,
+            "average_generation_time": avg_generation_time,
+            "average_tokens_used": self.average_tokens_used
+        }
+    
+    def update_prompt_style(self, new_style: Union[str, PromptStyle]):
+        """
+        Update the prompt style.
+        
+        Args:
+            new_style: New prompt style to use
+        """
+        self.prompt_style = new_style if isinstance(new_style, PromptStyle) else PromptStyle(new_style)
+    
+    def set_custom_prompt_template(self, template: str):
+        """
+        Set a custom prompt template.
+        
+        Args:
+            template: Custom template string with {context} and {query} placeholders
+        """
+        if "{context}" not in template or "{query}" not in template:
+            raise ValueError("Custom prompt template must contain {context} and {query} placeholders")
+            
+        self.custom_prompt_template = template
+        self.prompt_templates[PromptStyle.CUSTOM] = template
+        self.prompt_style = PromptStyle.CUSTOM
 
 
 
